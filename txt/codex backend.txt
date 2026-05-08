@@ -1,0 +1,504 @@
+import argparse
+import os
+from datetime import datetime
+from functools import wraps
+
+from dotenv import load_dotenv
+from flask import Flask, jsonify, render_template, request, session
+from flask_cors import CORS
+from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import event
+from werkzeug.security import check_password_hash, generate_password_hash
+
+load_dotenv()
+
+db = SQLAlchemy()
+
+
+def parse_allowed_origins(raw_value):
+    if not raw_value:
+        return []
+    return [origin.strip() for origin in raw_value.split(",") if origin.strip()]
+
+
+class Config:
+    SQLALCHEMY_DATABASE_URI = os.getenv(
+        "DATABASE_URL",
+        "sqlite:///land_rental.db",
+    )
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SECRET_KEY = os.getenv("SECRET_KEY", "change-this-before-production")
+    SESSION_COOKIE_HTTPONLY = True
+    SESSION_COOKIE_SAMESITE = os.getenv("SESSION_COOKIE_SAMESITE", "Lax")
+    SESSION_COOKIE_SECURE = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+    JSON_SORT_KEYS = False
+    CORS_ALLOWED_ORIGINS = parse_allowed_origins(os.getenv("CORS_ALLOWED_ORIGINS", ""))
+
+
+class AdminUser(db.Model):
+    __tablename__ = "admin_users"
+
+    admin_id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    full_name = db.Column(db.String(150), nullable=False)
+    email = db.Column(db.String(150), unique=True, nullable=True)
+    password_hash = db.Column(db.String(255), nullable=False)
+    is_active = db.Column(db.Boolean, nullable=False, default=True)
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
+
+    def set_password(self, raw_password):
+        self.password_hash = generate_password_hash(raw_password)
+
+    def check_password(self, raw_password):
+        return check_password_hash(self.password_hash, raw_password)
+
+    def to_dict(self):
+        return {
+            "admin_id": self.admin_id,
+            "username": self.username,
+            "full_name": self.full_name,
+            "email": self.email,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class Land(db.Model):
+    __tablename__ = "lands"
+
+    land_id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(150), nullable=False)
+    size = db.Column(db.Numeric(10, 2), nullable=True)
+    location = db.Column(db.String(250), nullable=False)
+    google_maps_link = db.Column(db.String(500), nullable=True)
+    price = db.Column(db.Numeric(20, 2), nullable=True)
+    price_type = db.Column(db.String(20), nullable=False, default="per month")
+    purpose = db.Column(db.String(250), nullable=True)
+    distance_toll = db.Column(db.Numeric(10, 2), nullable=True)
+    distance_harbour = db.Column(db.Numeric(10, 2), nullable=True)
+    industrial_permit = db.Column(db.Boolean, nullable=False, default=False)
+    amdal = db.Column(db.Boolean, nullable=False, default=False)
+    nearest_factory = db.Column(db.String(250), nullable=True)
+    advantages = db.Column(db.Text, nullable=True)
+    land_status = db.Column(db.String(20), nullable=False, default="available")
+    created_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+
+    translations = db.relationship(
+        "LandTranslation",
+        backref="land",
+        cascade="all, delete-orphan",
+        lazy=True,
+    )
+    images = db.relationship(
+        "LandImage",
+        backref="land",
+        cascade="all, delete-orphan",
+        lazy=True,
+        order_by="LandImage.sort_order.asc(), LandImage.image_id.asc()",
+    )
+
+
+class LandTranslation(db.Model):
+    __tablename__ = "land_translation"
+
+    translation_id = db.Column(db.Integer, primary_key=True)
+    land_id = db.Column(
+        db.Integer,
+        db.ForeignKey("lands.land_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    language = db.Column(db.String(10), nullable=False)
+    title = db.Column(db.String(150), nullable=True)
+    location = db.Column(db.String(250), nullable=True)
+    purpose = db.Column(db.String(250), nullable=True)
+    nearest_factory = db.Column(db.String(250), nullable=True)
+    advantages = db.Column(db.Text, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint("land_id", "language", name="uq_land_translation_land_language"),
+    )
+
+
+class LandImage(db.Model):
+    __tablename__ = "land_image"
+
+    image_id = db.Column(db.Integer, primary_key=True)
+    land_id = db.Column(
+        db.Integer,
+        db.ForeignKey("lands.land_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    image_url = db.Column(db.String(500), nullable=False)
+    sort_order = db.Column(db.Integer, nullable=False, default=0)
+
+
+def create_app():
+    app = Flask(__name__)
+    app.config.from_object(Config)
+
+    db.init_app(app)
+    cors_origins = app.config["CORS_ALLOWED_ORIGINS"] or "*"
+    CORS(app, supports_credentials=True, origins=cors_origins)
+
+    register_routes(app)
+    register_database_hooks(app)
+
+    return app
+
+
+def register_database_hooks(app):
+    if app.config["SQLALCHEMY_DATABASE_URI"].startswith("sqlite"):
+        with app.app_context():
+            @event.listens_for(db.engine, "connect")
+            def set_sqlite_pragma(dbapi_connection, connection_record):
+                cursor = dbapi_connection.cursor()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                cursor.close()
+
+
+def admin_required(route_handler):
+    @wraps(route_handler)
+    def wrapped(*args, **kwargs):
+        admin_id = session.get("admin_id")
+        if not admin_id:
+            return jsonify({"message": "Admin login required."}), 401
+
+        admin = db.session.get(AdminUser, admin_id)
+        if not admin or not admin.is_active:
+            session.clear()
+            return jsonify({"message": "Admin access is no longer valid."}), 401
+
+        return route_handler(*args, **kwargs)
+
+    return wrapped
+
+
+def pick_translation(land, language):
+    if not language:
+        return None
+
+    normalized = language.lower()
+    for translation in land.translations:
+        if translation.language.lower() == normalized:
+            return translation
+    return None
+
+
+def serialize_land(land, language=None):
+    translation = pick_translation(land, language)
+
+    return {
+        "land_id": land.land_id,
+        "title": translation.title if translation and translation.title else land.title,
+        "size": float(land.size) if land.size is not None else None,
+        "location": translation.location if translation and translation.location else land.location,
+        "google_maps_link": land.google_maps_link,
+        "price": float(land.price) if land.price is not None else None,
+        "price_type": land.price_type,
+        "purpose": translation.purpose if translation and translation.purpose else land.purpose,
+        "distance_toll": float(land.distance_toll) if land.distance_toll is not None else None,
+        "distance_harbour": float(land.distance_harbour) if land.distance_harbour is not None else None,
+        "industrial_permit": land.industrial_permit,
+        "amdal": land.amdal,
+        "nearest_factory": translation.nearest_factory if translation and translation.nearest_factory else land.nearest_factory,
+        "advantages": translation.advantages if translation and translation.advantages else land.advantages,
+        "land_status": land.land_status,
+        "created_at": land.created_at.isoformat(),
+        "language": translation.language if translation else "en",
+        "translations": [
+            {
+                "translation_id": item.translation_id,
+                "language": item.language,
+                "title": item.title,
+                "location": item.location,
+                "purpose": item.purpose,
+                "nearest_factory": item.nearest_factory,
+                "advantages": item.advantages,
+            }
+            for item in land.translations
+        ],
+        "images": [
+            {
+                "image_id": image.image_id,
+                "image_url": image.image_url,
+                "sort_order": image.sort_order,
+            }
+            for image in land.images
+        ],
+    }
+
+
+def apply_land_payload(land, payload):
+    land.title = payload.get("title", land.title)
+    land.size = payload.get("size", land.size)
+    land.location = payload.get("location", land.location)
+    land.google_maps_link = payload.get("google_maps_link", land.google_maps_link)
+    land.price = payload.get("price", land.price)
+    land.price_type = payload.get("price_type", land.price_type or "per month")
+    land.purpose = payload.get("purpose", land.purpose)
+    land.distance_toll = payload.get("distance_toll", land.distance_toll)
+    land.distance_harbour = payload.get("distance_harbour", land.distance_harbour)
+    land.industrial_permit = payload.get("industrial_permit", land.industrial_permit or False)
+    land.amdal = payload.get("amdal", land.amdal or False)
+    land.nearest_factory = payload.get("nearest_factory", land.nearest_factory)
+    land.advantages = payload.get("advantages", land.advantages)
+    land.land_status = payload.get("land_status", land.land_status or "available")
+
+    translation_payloads = payload.get("translations", [])
+    incoming_translations = {}
+    for entry in translation_payloads:
+        language = (entry.get("language") or "").strip().lower()
+        if language:
+            incoming_translations[language] = entry
+
+    existing_translations = {item.language.lower(): item for item in land.translations}
+
+    for language, entry in incoming_translations.items():
+        translation = existing_translations.get(language)
+        if not translation:
+            translation = LandTranslation(language=language)
+            land.translations.append(translation)
+
+        translation.title = entry.get("title")
+        translation.location = entry.get("location")
+        translation.purpose = entry.get("purpose")
+        translation.nearest_factory = entry.get("nearest_factory")
+        translation.advantages = entry.get("advantages")
+
+    for language, translation in list(existing_translations.items()):
+        if language not in incoming_translations:
+            db.session.delete(translation)
+
+    image_payloads = payload.get("images", [])
+    land.images.clear()
+    for index, entry in enumerate(image_payloads):
+        image_url = (entry.get("image_url") or "").strip()
+        if not image_url:
+            continue
+        land.images.append(
+            LandImage(
+                image_url=image_url,
+                sort_order=entry.get("sort_order", index),
+            )
+        )
+
+
+def validate_land_payload(payload):
+    required_fields = ["title", "location"]
+    missing_fields = [field for field in required_fields if not payload.get(field)]
+    if missing_fields:
+        return f"Missing required fields: {', '.join(missing_fields)}"
+
+    status = payload.get("land_status")
+    if status and status not in {"available", "not available"}:
+        return "land_status must be 'available' or 'not available'."
+
+    return None
+
+
+def register_routes(app):
+    @app.route("/")
+    def home():
+        return render_template("index.html")
+
+    @app.get("/health")
+    def health():
+        return jsonify(
+            {
+                "status": "ok",
+                "service": "land-rental-backend",
+                "time": datetime.utcnow().isoformat() + "Z",
+            }
+        )
+
+    @app.get("/api/lands")
+    def get_lands():
+        language = request.args.get("language", "zh")
+        status = request.args.get("status", "available")
+        location_keyword = request.args.get("location")
+        purpose_keyword = request.args.get("purpose")
+
+        query = Land.query
+        if status:
+            query = query.filter(Land.land_status == status)
+        if location_keyword:
+            query = query.filter(Land.location.ilike(f"%{location_keyword}%"))
+        if purpose_keyword:
+            query = query.filter(Land.purpose.ilike(f"%{purpose_keyword}%"))
+
+        lands = query.order_by(Land.created_at.desc()).all()
+        return jsonify([serialize_land(land, language) for land in lands])
+
+    @app.get("/api/lands/<int:land_id>")
+    def get_land(land_id):
+        language = request.args.get("language", "zh")
+        land = db.session.get(Land, land_id)
+        if not land:
+            return jsonify({"message": "Land not found."}), 404
+
+        return jsonify(serialize_land(land, language))
+
+    @app.post("/api/admin/login")
+    def admin_login():
+        payload = request.get_json(silent=True) or {}
+        username = (payload.get("username") or "").strip()
+        password = payload.get("password") or ""
+
+        if not username or not password:
+            return jsonify({"message": "Username and password are required."}), 400
+
+        admin = AdminUser.query.filter_by(username=username).first()
+        if not admin or not admin.is_active or not admin.check_password(password):
+            return jsonify({"message": "Invalid login credentials."}), 401
+
+        session.clear()
+        session["admin_id"] = admin.admin_id
+        return jsonify({"message": "Login successful.", "admin": admin.to_dict()})
+
+    @app.post("/api/admin/logout")
+    @admin_required
+    def admin_logout():
+        session.clear()
+        return jsonify({"message": "Logged out successfully."})
+
+    @app.get("/api/admin/me")
+    @admin_required
+    def admin_me():
+        admin = db.session.get(AdminUser, session["admin_id"])
+        return jsonify(admin.to_dict())
+
+    @app.get("/api/admin/dashboard")
+    @admin_required
+    def admin_dashboard():
+        return jsonify(
+            {
+                "total_lands": Land.query.count(),
+                "available_lands": Land.query.filter_by(land_status="available").count(),
+                "unavailable_lands": Land.query.filter_by(land_status="not available").count(),
+                "total_admins": AdminUser.query.filter_by(is_active=True).count(),
+            }
+        )
+
+    @app.get("/api/admin/lands")
+    @admin_required
+    def admin_get_lands():
+        lands = Land.query.order_by(Land.created_at.desc()).all()
+        return jsonify([serialize_land(land, request.args.get("language")) for land in lands])
+
+    @app.post("/api/admin/lands")
+    @admin_required
+    def admin_create_land():
+        payload = request.get_json(silent=True) or {}
+        error_message = validate_land_payload(payload)
+        if error_message:
+            return jsonify({"message": error_message}), 400
+
+        land = Land()
+        apply_land_payload(land, payload)
+        db.session.add(land)
+        db.session.commit()
+
+        return jsonify(serialize_land(land, payload.get("language"))), 201
+
+    @app.put("/api/admin/lands/<int:land_id>")
+    @admin_required
+    def admin_update_land(land_id):
+        land = db.session.get(Land, land_id)
+        if not land:
+            return jsonify({"message": "Land not found."}), 404
+
+        payload = request.get_json(silent=True) or {}
+        error_message = validate_land_payload(payload)
+        if error_message:
+            return jsonify({"message": error_message}), 400
+
+        apply_land_payload(land, payload)
+        db.session.commit()
+
+        return jsonify(serialize_land(land, payload.get("language")))
+
+    @app.delete("/api/admin/lands/<int:land_id>")
+    @admin_required
+    def admin_delete_land(land_id):
+        land = db.session.get(Land, land_id)
+        if not land:
+            return jsonify({"message": "Land not found."}), 404
+
+        db.session.delete(land)
+        db.session.commit()
+
+        return jsonify({"message": "Land deleted successfully."})
+
+
+def initialize_database(app):
+    with app.app_context():
+        db.create_all()
+
+
+def create_admin_user(app, username, password, full_name, email=None):
+    with app.app_context():
+        existing_user = AdminUser.query.filter_by(username=username).first()
+        if existing_user:
+            return False, f"Admin '{username}' already exists."
+
+        admin = AdminUser(
+            username=username,
+            full_name=full_name,
+            email=email,
+        )
+        admin.set_password(password)
+        db.session.add(admin)
+        db.session.commit()
+        return True, f"Admin '{username}' created successfully."
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Land rental backend service")
+    subparsers = parser.add_subparsers(dest="command")
+
+    subparsers.add_parser("init-db", help="Create database tables")
+
+    create_admin_parser = subparsers.add_parser("create-admin", help="Create an admin user")
+    create_admin_parser.add_argument("--username", required=True)
+    create_admin_parser.add_argument("--password", required=True)
+    create_admin_parser.add_argument("--full-name", required=True)
+    create_admin_parser.add_argument("--email")
+
+    run_parser = subparsers.add_parser("run", help="Run the development server")
+    run_parser.add_argument("--host", default=os.getenv("FLASK_RUN_HOST", "0.0.0.0"))
+    run_parser.add_argument("--port", type=int, default=int(os.getenv("FLASK_RUN_PORT", "5000")))
+    run_parser.add_argument("--debug", action="store_true")
+
+    args = parser.parse_args()
+    app = create_app()
+
+    if args.command == "init-db":
+        initialize_database(app)
+        print("Database tables created successfully.")
+        return
+
+    if args.command == "create-admin":
+        success, message = create_admin_user(
+            app,
+            username=args.username,
+            password=args.password,
+            full_name=args.full_name,
+            email=args.email,
+        )
+        print(message)
+        return
+
+    debug_enabled = bool(args.debug) if args.command == "run" else os.getenv("FLASK_DEBUG", "true").lower() == "true"
+    host = args.host if args.command == "run" else os.getenv("FLASK_RUN_HOST", "0.0.0.0")
+    port = args.port if args.command == "run" else int(os.getenv("FLASK_RUN_PORT", "5000"))
+    app.run(host=host, port=port, debug=debug_enabled)
+
+
+if __name__ == "__main__":
+    main()

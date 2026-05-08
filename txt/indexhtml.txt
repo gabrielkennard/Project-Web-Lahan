@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Land Rental Backend</title>
+</head>
+<body>
+    <h1>Land Rental Backend</h1>
+    <p> The backend service is running.</p>
+    <p>Use <code>/health</code> to check server status and <code>/api/lands</code> for public listings.</p>
+</body>
+</html>

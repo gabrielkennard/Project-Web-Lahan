@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Land Rental</title>
+</head>
+<body>
+    <h1>Land Listings</h1>
+
+    {% for land in lands %}
+        <div style="border:1px solid black; margin:10px; padding:10px;">
+            <p>ID: {{ land[0] }}</p>
+            <p>Name: {{ land[1] }}</p>
+            <p>Price: {{ land[2] }}</p>
+        </div>
+    {% endfor %}
+
+</body>
+</html>
