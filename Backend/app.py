@@ -17,9 +17,8 @@ db=mysql.connector.connect(
 @app.route('/')
 def home():
     cursor = db.cursor()
-    cursor.execute("SELECT * FROM properties")
+    cursor.execute("SELECT * FROM lands")
     lands = cursor.fetchall()
-
     return render_template('index.html', lands=lands)
 
 if __name__ == '__main__':

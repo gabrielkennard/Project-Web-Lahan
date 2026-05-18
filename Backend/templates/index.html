@@ -1,18 +1,39 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Land Rental</title>
+    <title>Ruswandi Indonesia Agency</title>
+
+    <link rel="stylesheet"
+            href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <h1>Land Listings</h1>
 
-    {% for land in lands %}
-        <div style="border:1px solid black; margin:10px; padding:10px;">
-            <p>ID: {{ land[0] }}</p>
-            <p>Name: {{ land[1] }}</p>
-            <p>Price: {{ land[2] }}</p>
+    <!-- Navbar -->
+    <nav>
+        <h2>Land Rental Agency - Ruswandi Indonesia Agency</h2>
+    </nav>
+
+    <!-- Hero Section -->
+    <section>
+        <h1>Welcome to Ruswandi Indonesia Agency</h1>
+        <p>Your trusted partner for land rentals in Indonesia.</p>
+    </section>
+
+    <!-- Land listing -->
+    <section>  
+        {% for land in lands %}
+        <div class="land-card">
+            <h2>{{ land[1] }}</h2>
+            <p><strong>ID:</strong> {{ land[0] }}</p>
+
+            <p>
+                <strong>Price:</strong>
+                ${{ "{:,.2f}".format(land[2]) }}
+            </p>
+
+            <button>View Details</button>
         </div>
-    {% endfor %}
-
+        {% endfor %}
+    </section>
 </body>
 </html>
